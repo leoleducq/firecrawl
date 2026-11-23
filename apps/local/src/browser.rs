@@ -13,7 +13,8 @@ use std::{
 use chromiumoxide::{
   browser::{Browser, BrowserConfig},
   cdp::browser_protocol::network::{
-    EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent, ResourceType,
+    EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent, Headers, ResourceType,
+    SetExtraHttpHeadersParams,
   },
   page::ScreenshotParams,
 };
@@ -344,6 +345,7 @@ impl BrowserPool {
   pub async fn render(
     self: &Arc<Self>,
     url: &Url,
+    accept_language: Option<&str>,
     wait_for: Duration,
     timeout: Duration,
     screenshot: bool,
@@ -353,9 +355,17 @@ impl BrowserPool {
     let (_caller, gone) = oneshot::channel::<()>();
     let pool = Arc::clone(self);
     let url = url.clone();
+    let accept_language = accept_language.map(str::to_owned);
     tokio::spawn(async move {
       pool
-        .render_in_tab(&url, wait_for, timeout, screenshot, gone)
+        .render_in_tab(
+          &url,
+          accept_language.as_deref(),
+          wait_for,
+          timeout,
+          screenshot,
+          gone,
+        )
         .await
     })
     .await
@@ -365,6 +375,7 @@ impl BrowserPool {
   async fn render_in_tab(
     &self,
     url: &Url,
+    accept_language: Option<&str>,
     wait_for: Duration,
     timeout: Duration,
     screenshot: bool,
@@ -389,7 +400,7 @@ impl BrowserPool {
     };
 
     let result = tokio::select! {
-      r = tokio::time::timeout(timeout, self.drive(&page, url, wait_for, screenshot)) => {
+      r = tokio::time::timeout(timeout, self.drive(&page, url, accept_language, wait_for, screenshot)) => {
         r.unwrap_or_else(|_| Err("the page did not finish loading in time".to_string()))
       }
       _ = gone => Err(CALLER_GONE.to_string()),
@@ -402,6 +413,7 @@ impl BrowserPool {
     &self,
     page: &chromiumoxide::Page,
     url: &Url,
+    accept_language: Option<&str>,
     wait_for: Duration,
     screenshot: bool,
   ) -> Result<Rendered, String> {
@@ -409,6 +421,16 @@ impl BrowserPool {
       .set_user_agent(self.user_agent.as_str())
       .await
       .map_err(|e| format!("could not set the user agent: {e}"))?;
+    if let Some(language) =
+      accept_language.filter(|value| reqwest::header::HeaderValue::from_str(value).is_ok())
+    {
+      page
+        .execute(SetExtraHttpHeadersParams::new(Headers::new(
+          serde_json::json!({ "Accept-Language": language }),
+        )))
+        .await
+        .map_err(|e| format!("could not set Accept-Language: {e}"))?;
+    }
     let _ = page.evaluate_on_new_document(NETWORK_TRACKER).await;
     let watch = NetWatch::start(page).await;
     let result = self
@@ -938,7 +960,7 @@ mod tests {
     // One more render than there are tabs: the last one is still waiting for
     // a tab when its caller hangs up.
     for _ in 0..3 {
-      let render = pool.render(&url, Duration::ZERO, Duration::from_secs(60), false);
+      let render = pool.render(&url, None, Duration::ZERO, Duration::from_secs(60), false);
       assert!(tokio::time::timeout(Duration::from_secs(2), render)
         .await
         .is_err());
